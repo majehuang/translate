@@ -5,3 +5,12 @@ edition.workspace = true
 
 [dependencies]
 audio-core = { path = "../audio-core" }
+gemini-live = { path = "../gemini-live" }
+audio-dsp = { path = "../audio-dsp" }
+diagnostics = { path = "../diagnostics" }
+device-manager = { path = "../device-manager" }
+tokio = { workspace = true }
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
