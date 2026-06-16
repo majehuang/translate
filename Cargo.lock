@@ -186,6 +186,8 @@ dependencies = [
  "audio-core",
  "audio-cpal",
  "audio-dsp",
+ "device-manager",
+ "engine",
  "gemini-live",
  "tokio",
  "tracing",
@@ -289,6 +291,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4ae5f15dda3c708c0ade84bfee31ccab44a3da4f88015ed22f63732abe300c8"
 
 [[package]]
+name = "device-manager"
+version = "0.1.0"
+dependencies = [
+ "audio-core",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "diagnostics"
+version = "0.1.0"
+dependencies = [
+ "audio-core",
+]
+
+[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -309,6 +326,12 @@ name = "engine"
 version = "0.1.0"
 dependencies = [
  "audio-core",
+ "audio-dsp",
+ "device-manager",
+ "diagnostics",
+ "gemini-live",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
