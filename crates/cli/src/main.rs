@@ -1,131 +1,150 @@
-//! M1 验证 CLI：物理麦 → 重采样 16k → Gemini Live Translate → 24k 播放到扬声器。
-//! 用法：
-//!   GEMINI_API_KEY=xxx cargo run -p cli -- --target en --in-device "<麦克风名>" --out-device "<扬声器名>"
-//! 不带 --in-device 时列出设备并退出。
-use audio_core::{AudioBackend, DeviceId, PcmFrame, StreamCfg};
+//! M2 CLI 薄壳：设备分类列表、路由矩阵校验、双链路 engine 编排。
+use audio_core::{AudioBackend, DeviceId, DeviceInfo, Direction};
 use audio_cpal::CpalBackend;
-use audio_dsp::Resampler;
-use gemini_live::session::{connect_with_retry, SessionConfig};
-use std::time::Instant;
+use device_manager::{classify, DeviceManager, DeviceUse};
+use engine::control::{ControlEvent, SourceLang, TranslateMode};
+use engine::orchestrator;
+use engine::route::{build_routes, validate_isolation, LinkIntent, RouteSpec};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
-const MODEL: &str = "models/gemini-3.5-live-translate-preview";
-const GEMINI_IN_RATE: u32 = 16_000;
-const GEMINI_OUT_RATE: u32 = 24_000;
+const GEMINI_WS: &str = "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt::init();
-    let args: Vec<String> = std::env::args().collect();
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let backend = CpalBackend::new();
 
-    let in_device = arg_value(&args, "--in-device");
-    let out_device = arg_value(&args, "--out-device");
-    let target = arg_value(&args, "--target").unwrap_or_else(|| "en".to_string());
-
-    if in_device.is_none() {
-        println!("== 输入设备 ==");
-        for device in backend.list_inputs()? {
-            println!(
-                "  {}{}",
-                device.name,
-                if device.is_default { " [默认]" } else { "" }
-            );
-        }
-        println!("== 输出设备 ==");
-        for device in backend.list_outputs()? {
-            println!(
-                "  {}{}",
-                device.name,
-                if device.is_default { " [默认]" } else { "" }
-            );
-        }
-        println!("\n请用 --in-device/--out-device 指定设备后重跑。");
+    if arg_value(&args, "--uplink-in").is_none() {
+        let manager = DeviceManager::new(backend)?;
+        print_device_table(manager.snapshot());
+        println!();
+        println!("请用 --uplink-in/--uplink-out/--downlink-in/--downlink-out 指定设备后重跑。");
         return Ok(());
     }
 
-    let out_device = out_device.ok_or_else(|| anyhow::anyhow!("缺少 --out-device 输出设备参数"))?;
+    let spec = build_spec(&args)?;
+    let devices = all_devices(&backend)?;
+    let matrix = build_routes(&spec, &devices)?;
+    validate_isolation(&matrix, &devices)?;
+
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| anyhow::anyhow!("缺少 GEMINI_API_KEY 环境变量"))?;
-    // API Key 鉴权用 ?key=（access_token= 仅适用于 OAuth bearer，AI Studio key 会被拒为
-    // "unregistered callers"）。已用 examples/smoke 对真实 API 实测确认。
-    let url = format!(
-        "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={api_key}"
-    );
-
-    let cfg = StreamCfg {
-        sample_rate: 48_000,
-        channels: 1,
-        frame_size: 480,
-    };
-    let (in_stream, mut mic_cons) =
-        backend.open_input(&DeviceId(in_device.expect("checked above")), cfg)?;
-    let (out_stream, mut spk_prod) = backend.open_output(&DeviceId(out_device), cfg)?;
-    let in_rate = in_stream.actual_sample_rate();
-    let out_rate = out_stream.actual_sample_rate();
-    tracing::info!(in_rate, out_rate, %target, "音频设备已打开");
-
-    let (audio_tx, mut audio_rx) = connect_with_retry(
-        || SessionConfig {
-            url: url.clone(),
-            model: MODEL.into(),
-            out_rate: GEMINI_OUT_RATE,
-            target_lang: target.clone(),
-            echo_target_language: false,
-        },
-        5,
-    )
-    .await
-    .map_err(|err| anyhow::anyhow!("Gemini 连接失败: {err}"))?;
-    tracing::info!("Gemini 已连接");
-
-    let up_chunk = (in_rate / 100) as usize;
-    let mut up_resampler = Resampler::new(in_rate, GEMINI_IN_RATE, up_chunk);
-    let send_started = Instant::now();
-    tokio::spawn(async move {
-        let mut buf = vec![0i16; up_chunk];
-        loop {
-            let got = mic_cons.pop_slice(&mut buf);
-            if got == up_chunk {
-                let frame = PcmFrame::new(buf.clone(), in_rate);
-                let frame16 = up_resampler.process(&frame);
-                if audio_tx.send(frame16).await.is_err() {
-                    break;
-                }
-            } else {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
+    let make_url = Arc::new(move || format!("{GEMINI_WS}?key={api_key}"));
+    let (evt_tx, mut evt_rx) = mpsc::channel::<ControlEvent>(64);
+    let printer = tokio::spawn(async move {
+        while let Some(event) = evt_rx.recv().await {
+            println!("{event:?}");
         }
     });
 
-    let mut down_resampler = Resampler::new(GEMINI_OUT_RATE, out_rate, 480);
-    let mut first_audio_logged = false;
-    tokio::spawn(async move {
-        while let Some(frame24) = audio_rx.recv().await {
-            if !first_audio_logged {
-                let latency_ms = send_started.elapsed().as_millis();
-                tracing::info!(latency_ms, "首个翻译音频到达");
-                first_audio_logged = true;
-            }
-            for chunk in frame24.samples.chunks(480) {
-                let mut block = chunk.to_vec();
-                block.resize(480, 0);
-                let frame = PcmFrame::new(block, GEMINI_OUT_RATE);
-                let out = down_resampler.process(&frame);
-                let _ = spk_prod.push_slice(&out.samples);
-            }
-        }
-    });
-
-    println!("运行中，对着麦克风说话；Ctrl+C 停止。");
+    let orch = orchestrator::start(matrix, Arc::new(CpalBackend::new()), make_url, evt_tx).await?;
+    println!("运行中，Ctrl+C 停止。当前顶层状态：{:?}", orch.top_state());
     tokio::signal::ctrl_c().await?;
-    drop(in_stream);
-    drop(out_stream);
+    orch.stop();
+    printer.abort();
     println!("已停止。");
     Ok(())
+}
+
+fn print_device_table(snapshot: &device_manager::DeviceSnapshot) {
+    println!("== 输入设备 ==");
+    for device in &snapshot.inputs {
+        print_device(device, Direction::Input);
+    }
+    println!("== 输出设备 ==");
+    for device in &snapshot.outputs {
+        print_device(device, Direction::Output);
+    }
+}
+
+fn print_device(device: &DeviceInfo, direction: Direction) {
+    let default = if device.is_default { " [default]" } else { "" };
+    let use_tag = match classify(device, direction) {
+        DeviceUse::VirtualMic => "[virtual-mic]",
+        DeviceUse::VirtualSpeaker => "[virtual-speaker]",
+        DeviceUse::Physical => "[physical]",
+    };
+    println!("  {use_tag}{default} {}", device.name);
+}
+
+fn all_devices(backend: &CpalBackend) -> anyhow::Result<Vec<DeviceInfo>> {
+    let mut devices = backend.list_inputs()?;
+    devices.extend(backend.list_outputs()?);
+    Ok(devices)
+}
+
+fn parse_mode(args: &[String]) -> TranslateMode {
+    match arg_value(args, "--mode").as_deref() {
+        Some("uplink-only") => TranslateMode::UplinkOnly,
+        Some("downlink-only") => TranslateMode::DownlinkOnly,
+        _ => TranslateMode::Bidirectional,
+    }
+}
+
+fn build_spec(args: &[String]) -> anyhow::Result<RouteSpec> {
+    let uplink_in = required_arg(args, "--uplink-in")?;
+    let uplink_out = required_arg(args, "--uplink-out")?;
+    let downlink_in = arg_value(args, "--downlink-in").unwrap_or_else(|| uplink_in.clone());
+    let downlink_out = arg_value(args, "--downlink-out").unwrap_or_else(|| uplink_out.clone());
+    let uplink_target = arg_value(args, "--uplink-target").unwrap_or_else(|| "en".into());
+    let downlink_target = arg_value(args, "--downlink-target").unwrap_or_else(|| "zh".into());
+
+    Ok(RouteSpec {
+        mode: parse_mode(args),
+        uplink: LinkIntent {
+            in_dev: DeviceId(uplink_in),
+            out_dev: DeviceId(uplink_out),
+            target_lang: uplink_target,
+            source: SourceLang::Auto,
+        },
+        downlink: LinkIntent {
+            in_dev: DeviceId(downlink_in),
+            out_dev: DeviceId(downlink_out),
+            target_lang: downlink_target,
+            source: SourceLang::Auto,
+        },
+    })
+}
+
+fn required_arg(args: &[String], key: &str) -> anyhow::Result<String> {
+    arg_value(args, key).ok_or_else(|| anyhow::anyhow!("缺少参数 {key}"))
 }
 
 fn arg_value(args: &[String], key: &str) -> Option<String> {
     args.iter()
         .position(|arg| arg == key)
         .and_then(|index| args.get(index + 1).cloned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use engine::control::TranslateMode;
+
+    #[test]
+    fn parse_mode_defaults_and_variants() {
+        assert_eq!(
+            parse_mode(&["--mode".into(), "uplink-only".into()]),
+            TranslateMode::UplinkOnly
+        );
+        assert_eq!(
+            parse_mode(&["--mode".into(), "downlink-only".into()]),
+            TranslateMode::DownlinkOnly
+        );
+        assert_eq!(parse_mode(&[]), TranslateMode::Bidirectional);
+    }
+
+    #[test]
+    fn build_spec_maps_args_to_intents() {
+        let args: Vec<String> = "--mode bidirectional --uplink-in PhysMic --uplink-out VirtMic --uplink-target en --downlink-in VirtSpk --downlink-out PhysHeadset --downlink-target zh"
+            .split(' ')
+            .map(String::from)
+            .collect();
+        let spec = build_spec(&args).unwrap();
+        assert_eq!(spec.uplink.in_dev.0, "PhysMic");
+        assert_eq!(spec.downlink.out_dev.0, "PhysHeadset");
+        assert_eq!(spec.downlink.target_lang, "zh");
+    }
 }

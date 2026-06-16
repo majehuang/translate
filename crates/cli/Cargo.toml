@@ -8,6 +8,8 @@ audio-core = { path = "../audio-core" }
 audio-cpal = { path = "../audio-cpal" }
 audio-dsp = { path = "../audio-dsp" }
 gemini-live = { path = "../gemini-live" }
+engine = { path = "../engine" }
+device-manager = { path = "../device-manager" }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
 anyhow.workspace = true
 tracing.workspace = true
