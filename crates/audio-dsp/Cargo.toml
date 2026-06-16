@@ -1,0 +1,9 @@
+[package]
+name = "audio-dsp"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+rubato.workspace = true
+audio-core = { path = "../audio-core" }
+thiserror.workspace = true
