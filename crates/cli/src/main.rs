@@ -43,8 +43,7 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let out_device =
-        out_device.ok_or_else(|| anyhow::anyhow!("缺少 --out-device 输出设备参数"))?;
+    let out_device = out_device.ok_or_else(|| anyhow::anyhow!("缺少 --out-device 输出设备参数"))?;
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| anyhow::anyhow!("缺少 GEMINI_API_KEY 环境变量"))?;
     let url = format!(

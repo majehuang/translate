@@ -17,7 +17,7 @@ async fn session_sends_setup_and_receives_audio() {
         assert!(first.into_text().unwrap().contains("generationConfig"));
         let resp = r#"{"serverContent":{"modelTurn":{"parts":[
             {"inlineData":{"mimeType":"audio/pcm;rate=24000","data":"AQACAA=="}}]}}}"#;
-        ws.send(Message::Text(resp.to_string().into())).await.unwrap();
+        ws.send(Message::Text(resp.to_string())).await.unwrap();
         let _ = ws.next().await;
     });
 

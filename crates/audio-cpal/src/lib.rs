@@ -245,9 +245,15 @@ impl AudioBackend for CpalBackend {
         let (prod, cons) = audio_channel(rate as usize * channels);
         let stream_config = supported.config();
         let stream = match supported.sample_format() {
-            SampleFormat::F32 => build_output_stream::<f32>(&device, &stream_config, channels, cons),
-            SampleFormat::I16 => build_output_stream::<i16>(&device, &stream_config, channels, cons),
-            SampleFormat::U16 => build_output_stream::<u16>(&device, &stream_config, channels, cons),
+            SampleFormat::F32 => {
+                build_output_stream::<f32>(&device, &stream_config, channels, cons)
+            }
+            SampleFormat::I16 => {
+                build_output_stream::<i16>(&device, &stream_config, channels, cons)
+            }
+            SampleFormat::U16 => {
+                build_output_stream::<u16>(&device, &stream_config, channels, cons)
+            }
             sample_format => Err(AudioError::OpenStream(format!(
                 "不支持的输出采样格式: {sample_format:?}"
             ))),

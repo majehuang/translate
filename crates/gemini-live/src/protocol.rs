@@ -101,7 +101,10 @@ mod tests {
         let s = Setup::new_translate("models/gemini-3.5-live-translate");
         let json = serde_json::to_value(&s).unwrap();
         assert_eq!(json["setup"]["model"], "models/gemini-3.5-live-translate");
-        assert_eq!(json["setup"]["generationConfig"]["responseModalities"][0], "AUDIO");
+        assert_eq!(
+            json["setup"]["generationConfig"]["responseModalities"][0],
+            "AUDIO"
+        );
     }
 
     #[test]
@@ -115,7 +118,10 @@ mod tests {
             },
         };
         let json = serde_json::to_value(&ri).unwrap();
-        assert_eq!(json["realtimeInput"]["audio"]["mimeType"], "audio/pcm;rate=16000");
+        assert_eq!(
+            json["realtimeInput"]["audio"]["mimeType"],
+            "audio/pcm;rate=16000"
+        );
         assert_eq!(json["realtimeInput"]["audio"]["data"], "AAAA");
     }
 
