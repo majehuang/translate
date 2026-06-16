@@ -36,7 +36,7 @@
 
 - `cargo fmt --all -- --check`：通过。
 - `cargo clippy --workspace --all-targets -- -D warnings`：通过。
-- `cargo test --workspace`：51 passed。
+- `cargo test --workspace`：53 passed。
 
 逐 crate 测试数：
 
@@ -46,7 +46,7 @@
 - `cli`：2 passed。
 - `device-manager`：5 passed。
 - `diagnostics`：6 passed。
-- `engine`：11 passed。
+- `engine`：13 passed。
 - `gemini-live`：10 unit passed + 1 integration passed。
 
 额外验收：
@@ -97,3 +97,38 @@ GEMINI_API_KEY=<key> cargo run -p cli -- \
 ```
 
 - 优先验证：路由隔离拒绝启动、双链路独立状态事件、真实回环暂停、VAD saved_ratio、热插拔后错误提示和设备刷新。
+
+## 7. r2 修复说明
+
+### 7.1 修复范围
+
+- 修复 `crates/engine/src/link.rs`：`run_link` 在 Session 上行发送失败或下行接收关闭后，不再退出 task，而是进入外层重连循环。
+- 已打开的 input/output 物理流、VAD 与上下行 resampler 保持在重连循环外，Session 断开后只重建 Gemini Session。
+- 上行发送从 `send().await` 改为 `try_send`，避免 channel 满时阻塞整个 `select!`；满队列时本地 pending 队列复用 `gemini_live::session::drop_stale_frames` 语义，只保留最新帧。
+
+### 7.2 行为说明
+
+- 初始连接失败：状态置 `Error(...)` 后退出。
+- 已运行链路断开：状态置 `Reconnecting { attempt: 1 }`，重新调用 `connect_with_retry` 建立新 Session。
+- 重连阶段继续失败：`attempt` 递增；达到 5 次仍失败后状态置 `Error(...)` 并退出。
+- 重连成功：状态回到 `Running`，继续复用原物理流与 resampler 泵音频。
+- `LinkHandle.abort()` 仍通过 tokio task abort 中止；外层循环没有忙等。
+
+### 7.3 新增自动测试
+
+- `engine::link::tests::reconnect_budget_retries_then_returns_to_running_budget`：覆盖断开后 `Reconnecting{1}`、连接失败递增到上限、成功后重置。
+- `engine::link::tests::upstream_backpressure_keeps_latest_pending_frame`：覆盖上行满队列时不 await、不堆积旧帧，只保留最新 pending frame。
+
+说明：`run_link` 完整音频泵依赖实时音频 ring 与 tokio 调度，直接单测容易受调度时序影响；本轮将重连预算/状态推进抽成确定性单元测试覆盖，真实 WebSocket 断线恢复仍建议 QA 在真机联调项中验证。
+
+### 7.4 r2 自测结果
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+- `cargo test --workspace`：53 passed；逐 crate：`audio-core` 6、`audio-cpal` 2、`audio-dsp` 8、`cli` 2、`device-manager` 5、`diagnostics` 6、`engine` 13、`gemini-live` 10 unit + 1 integration。
+- `cargo run -p cli`：通过；无参打印输入/输出设备表头与参数提示，未 panic。
+
+### 7.5 提交计划
+
+- commit message：`fix: 修复链路断开后的真实重连`
+- 文件：`crates/engine/src/link.rs`、`TASK/delivery/DELIVERY-003.md`
