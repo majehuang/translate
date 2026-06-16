@@ -22,14 +22,28 @@ pub enum SessionState {
     Starting,
     Running,
     Reconnecting { attempt: u32 },
+    Paused,
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseReason {
+    AcousticLoop,
+}
+
 /// 控制面发给 UI 的事件。
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ControlEvent {
     UplinkState(SessionState),
     DownlinkState(SessionState),
+    LoopSuspected {
+        lag_frames: u16,
+        xcorr: f32,
+    },
+    TranslationPaused {
+        reason: PauseReason,
+    },
+    TranslationResumed,
     /// auto 模式下模型返回的检测语言码（只读，供 UI 显示/字幕预埋）。
     DetectedLanguage {
         uplink: bool,
@@ -41,7 +55,8 @@ pub enum ControlEvent {
 pub fn worst_state(up: &SessionState, down: &SessionState) -> SessionState {
     fn rank(s: &SessionState) -> u8 {
         match s {
-            SessionState::Error(_) => 4,
+            SessionState::Error(_) => 5,
+            SessionState::Paused => 4,
             SessionState::Reconnecting { .. } => 3,
             SessionState::Starting => 2,
             SessionState::Running => 1,
@@ -81,6 +96,21 @@ mod tests {
         assert_eq!(
             worst_state(&SessionState::Running, &SessionState::Running),
             SessionState::Running
+        );
+    }
+
+    #[test]
+    fn worst_picks_paused_over_reconnecting() {
+        let up = SessionState::Paused;
+        let down = SessionState::Reconnecting { attempt: 2 };
+        assert_eq!(worst_state(&up, &down), SessionState::Paused);
+    }
+
+    #[test]
+    fn worst_picks_error_over_paused() {
+        assert_eq!(
+            worst_state(&SessionState::Error("net".into()), &SessionState::Paused),
+            SessionState::Error("net".into())
         );
     }
 }
