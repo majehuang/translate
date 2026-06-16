@@ -2,6 +2,8 @@
 //! 上层（engine 及以上）禁止出现 #[cfg(target_os)]。
 
 use crate::ring::{AudioConsumer, AudioProducer};
+use std::sync::mpsc;
+use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
 pub enum AudioError {
@@ -22,6 +24,41 @@ pub struct DeviceInfo {
     pub is_default: bool,
     /// 名字匹配虚拟设备（Windows: VB-Audio/CABLE；macOS: BlackHole）。
     pub is_virtual: bool,
+}
+
+/// 设备方向（输入=采集，输出=播放）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Direction {
+    Input,
+    Output,
+}
+
+/// 后端发出的原始设备变更事件：发完整快照，语义 diff 交给 device-manager 纯函数。
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawDeviceEvent {
+    ListChanged {
+        inputs: Vec<DeviceInfo>,
+        outputs: Vec<DeviceInfo>,
+    },
+}
+
+/// 设备变更订阅句柄。后端在独立线程推送 RawDeviceEvent，上层低频轮询消费。
+pub struct DeviceWatchHandle {
+    rx: mpsc::Receiver<RawDeviceEvent>,
+}
+
+impl DeviceWatchHandle {
+    pub fn new(rx: mpsc::Receiver<RawDeviceEvent>) -> Self {
+        Self { rx }
+    }
+
+    pub fn try_recv(&self) -> Option<RawDeviceEvent> {
+        self.rx.try_recv().ok()
+    }
+
+    pub fn recv_timeout(&self, duration: Duration) -> Option<RawDeviceEvent> {
+        self.rx.recv_timeout(duration).ok()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -59,6 +96,8 @@ pub trait AudioBackend: Send + Sync {
         id: &DeviceId,
         cfg: StreamCfg,
     ) -> Result<(Box<dyn OutputStream>, AudioProducer), AudioError>;
+    /// 订阅设备增删变更。返回低频控制事件通道句柄。
+    fn watch_devices(&self) -> Result<DeviceWatchHandle, AudioError>;
 }
 
 /// 名字是否匹配已知虚拟音频设备。
@@ -82,5 +121,21 @@ mod tests {
         ));
         assert!(!is_virtual_device_name("MacBook Pro Microphone"));
         assert!(!is_virtual_device_name("Realtek High Definition Audio"));
+    }
+
+    #[test]
+    fn watch_handle_relays_raw_event() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let h = DeviceWatchHandle::new(rx);
+        assert!(h.try_recv().is_none());
+        tx.send(RawDeviceEvent::ListChanged {
+            inputs: vec![],
+            outputs: vec![],
+        })
+        .unwrap();
+        assert!(matches!(
+            h.try_recv(),
+            Some(RawDeviceEvent::ListChanged { .. })
+        ));
     }
 }
