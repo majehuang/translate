@@ -1,7 +1,7 @@
 //! CPAL 实现的 AudioBackend，覆盖 Windows(WASAPI) 与 macOS(CoreAudio)。
 use audio_core::{
     audio_channel, is_virtual_device_name, AudioBackend, AudioConsumer, AudioError, AudioProducer,
-    DeviceId, DeviceInfo, InputStream, OutputStream, StreamCfg,
+    DeviceId, DeviceInfo, DeviceWatchHandle, InputStream, OutputStream, RawDeviceEvent, StreamCfg,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, Sample, SampleFormat, SizedSample};
@@ -270,6 +270,45 @@ impl AudioBackend for CpalBackend {
             prod,
         ))
     }
+
+    fn watch_devices(&self) -> Result<DeviceWatchHandle, AudioError> {
+        let (tx, rx) = mpsc::channel();
+        std::thread::Builder::new()
+            .name("cpal-device-watch".into())
+            .spawn(move || {
+                let backend = CpalBackend::new();
+                let mut prev: Option<(Vec<DeviceInfo>, Vec<DeviceInfo>)> = None;
+                loop {
+                    let inputs = backend.list_inputs().unwrap_or_default();
+                    let outputs = backend.list_outputs().unwrap_or_default();
+                    if inputs.is_empty() && outputs.is_empty() {
+                        std::thread::sleep(Duration::from_millis(1000));
+                        continue;
+                    }
+
+                    let changed = match &prev {
+                        Some((prev_inputs, prev_outputs)) => {
+                            prev_inputs != &inputs || prev_outputs != &outputs
+                        }
+                        None => false,
+                    };
+                    if changed
+                        && tx
+                            .send(RawDeviceEvent::ListChanged {
+                                inputs: inputs.clone(),
+                                outputs: outputs.clone(),
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
+                    prev = Some((inputs, outputs));
+                    std::thread::sleep(Duration::from_millis(1000));
+                }
+            })
+            .map_err(|err| AudioError::OpenStream(err.to_string()))?;
+        Ok(DeviceWatchHandle::new(rx))
+    }
 }
 
 #[cfg(test)]
@@ -282,5 +321,12 @@ mod tests {
         let backend = CpalBackend::new();
         let _ = backend.list_inputs();
         let _ = backend.list_outputs();
+    }
+
+    #[test]
+    fn watch_devices_returns_handle_without_panicking() {
+        let backend = CpalBackend::new();
+        let handle = backend.watch_devices().expect("watch handle");
+        assert!(handle.try_recv().is_none());
     }
 }
