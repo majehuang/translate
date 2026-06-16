@@ -18,6 +18,17 @@ pub struct SetupBody {
 #[serde(rename_all = "camelCase")]
 pub struct GenerationConfig {
     pub response_modalities: Vec<String>,
+    pub translation_config: TranslationConfig,
+}
+
+/// Live Translate 配置。auto 模式：只锁目标语言，源语言由模型自动识别。
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranslationConfig {
+    /// 目标语言 BCP-47 码，如 "en"/"zh"。
+    pub target_language_code: String,
+    /// 输入已是目标语言时是否原样回放（true）还是静音（false）。
+    pub echo_target_language: bool,
 }
 
 /// 实时音频输入帧。audio 为 base64 的 16k/16-bit/mono/LE PCM。
@@ -79,13 +90,18 @@ pub struct InlineData {
 }
 
 impl Setup {
-    /// 构造 Live Translate 的 setup。auto 模式下 source 不写入（由模型识别）。
-    pub fn new_translate(model: &str) -> Self {
+    /// 构造 Live Translate 的 setup。auto 模式下 source 不写入（由模型识别），
+    /// 只锁目标语言 `target_lang`（BCP-47）。`echo` 控制同语言时回放/静音。
+    pub fn new_translate(model: &str, target_lang: &str, echo: bool) -> Self {
         Setup {
             setup: SetupBody {
                 model: model.to_string(),
                 generation_config: GenerationConfig {
                     response_modalities: vec!["AUDIO".to_string()],
+                    translation_config: TranslationConfig {
+                        target_language_code: target_lang.to_string(),
+                        echo_target_language: echo,
+                    },
                 },
             },
         }
@@ -98,13 +114,29 @@ mod tests {
 
     #[test]
     fn setup_serializes_with_camel_case() {
-        let s = Setup::new_translate("models/gemini-3.5-live-translate");
+        let s = Setup::new_translate("models/gemini-3.5-live-translate-preview", "en", true);
         let json = serde_json::to_value(&s).unwrap();
-        assert_eq!(json["setup"]["model"], "models/gemini-3.5-live-translate");
+        assert_eq!(
+            json["setup"]["model"],
+            "models/gemini-3.5-live-translate-preview"
+        );
         assert_eq!(
             json["setup"]["generationConfig"]["responseModalities"][0],
             "AUDIO"
         );
+        // 真实 API 校验：translationConfig 必须嵌在 generationConfig 内（见 examples/smoke 实测）。
+        let tc = &json["setup"]["generationConfig"]["translationConfig"];
+        assert_eq!(tc["targetLanguageCode"], "en");
+        assert_eq!(tc["echoTargetLanguage"], true);
+    }
+
+    #[test]
+    fn setup_omits_source_language_in_auto_mode() {
+        // auto 模式：不应出现任何 source 字段，源语言交给模型识别。
+        let s = Setup::new_translate("models/gemini-3.5-live-translate-preview", "zh", false);
+        let json = serde_json::to_value(&s).unwrap();
+        assert!(json["setup"].get("sourceLanguageCode").is_none());
+        assert!(json["setup"]["generationConfig"].get("source").is_none());
     }
 
     #[test]

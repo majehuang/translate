@@ -25,6 +25,8 @@ async fn session_sends_setup_and_receives_audio() {
         url: format!("ws://{addr}"),
         model: "models/test".into(),
         out_rate: 24_000,
+        target_lang: "en".into(),
+        echo_target_language: false,
     })
     .await
     .unwrap();

@@ -8,7 +8,7 @@ use audio_dsp::Resampler;
 use gemini_live::session::{connect_with_retry, SessionConfig};
 use std::time::Instant;
 
-const MODEL: &str = "models/gemini-3.5-live-translate";
+const MODEL: &str = "models/gemini-3.5-live-translate-preview";
 const GEMINI_IN_RATE: u32 = 16_000;
 const GEMINI_OUT_RATE: u32 = 24_000;
 
@@ -46,8 +46,10 @@ async fn main() -> anyhow::Result<()> {
     let out_device = out_device.ok_or_else(|| anyhow::anyhow!("缺少 --out-device 输出设备参数"))?;
     let api_key = std::env::var("GEMINI_API_KEY")
         .map_err(|_| anyhow::anyhow!("缺少 GEMINI_API_KEY 环境变量"))?;
+    // API Key 鉴权用 ?key=（access_token= 仅适用于 OAuth bearer，AI Studio key 会被拒为
+    // "unregistered callers"）。已用 examples/smoke 对真实 API 实测确认。
     let url = format!(
-        "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?access_token={api_key}"
+        "wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key={api_key}"
     );
 
     let cfg = StreamCfg {
@@ -67,6 +69,8 @@ async fn main() -> anyhow::Result<()> {
             url: url.clone(),
             model: MODEL.into(),
             out_rate: GEMINI_OUT_RATE,
+            target_lang: target.clone(),
+            echo_target_language: false,
         },
         5,
     )
