@@ -1,0 +1,8 @@
+[package]
+name = "device-manager"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+audio-core = { path = "../audio-core" }
+thiserror.workspace = true
