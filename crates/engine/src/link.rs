@@ -242,6 +242,12 @@ async fn pump_session(
     let mut downstream_dropped_samples = 0u64;
     let mut last_diag_log = Instant::now();
     let mut loop_guard = LoopGuardRuntime::new(conservative_loop_thresholds(), LOOP_WINDOW_FRAMES);
+    // 实验开关：设 TRANSLATE_NO_VAD=1 则不丢静音、发连续音频，交给 Gemini 服务端做 turn 检测。
+    // 用于排查"同一句译文重复多遍"是否由客户端 VAD 切碎语音、破坏服务端断句导致。
+    let vad_disabled = std::env::var("TRANSLATE_NO_VAD").is_ok();
+    if vad_disabled {
+        tracing::info!(?kind, "上行 VAD 已禁用（发连续音频）");
+    }
 
     loop {
         tokio::select! {
@@ -255,7 +261,12 @@ async fn pump_session(
                     if let Some(action) = loop_guard.observe_captured(input_buf) {
                         handle_loop_action(action, kind, &loop_guard, state_tx, evt_tx);
                     }
-                    if !loop_guard.is_paused() && vad.observe(input_buf) == VadDecision::Send {
+                    let voice_active = if vad_disabled {
+                        true
+                    } else {
+                        vad.observe(input_buf) == VadDecision::Send
+                    };
+                    if !loop_guard.is_paused() && voice_active {
                         let frame = PcmFrame::new(input_buf.to_vec(), input_rate);
                         let frame16 = up_resampler.process(&frame);
                         if enqueue_latest_upstream(&audio_tx, &mut pending_upstream, frame16).is_err() {
