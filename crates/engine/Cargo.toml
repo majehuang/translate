@@ -11,6 +11,7 @@ diagnostics = { path = "../diagnostics" }
 device-manager = { path = "../device-manager" }
 tokio = { workspace = true }
 thiserror.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }

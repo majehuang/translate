@@ -50,10 +50,10 @@ pub async fn start(
     let mut uplink = None;
     let mut downlink = None;
     if let Some(role) = &matrix.uplink {
-        uplink = Some(spawn_link(role, backend.clone(), make_url.clone()).await?);
+        uplink = Some(spawn_link(role, backend.clone(), make_url.clone(), evt_tx.clone()).await?);
     }
     if let Some(role) = &matrix.downlink {
-        downlink = Some(spawn_link(role, backend.clone(), make_url.clone()).await?);
+        downlink = Some(spawn_link(role, backend.clone(), make_url.clone(), evt_tx.clone()).await?);
     }
     spawn_state_relay(&uplink, &downlink, evt_tx);
     Ok(Orchestrator {

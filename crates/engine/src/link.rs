@@ -1,12 +1,17 @@
 //! 单条链路的独立运行单元：独立 Session、独立重连、独立背压、独立过期帧丢弃。
-use crate::control::SessionState;
+use crate::control::{ControlEvent, PauseReason, SessionState};
 use crate::route::{LinkKind, LinkRole, RouteError};
 use audio_core::{AudioBackend, PcmFrame, StreamCfg};
 use audio_dsp::{Resampler, Vad, VadConfig, VadDecision};
+use diagnostics::{
+    detect_loop, frame_energy, step_guard, FrameEnergy, GuardAction, LoopEvidence, LoopGuardState,
+    LoopThresholds,
+};
 use gemini_live::session::{connect_with_retry, drop_stale_frames, SessionConfig, SessionError};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 
@@ -18,6 +23,9 @@ const DEVICE_FRAME: usize = 480;
 const SESSION_CONNECT_ATTEMPTS: u32 = 5;
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const UPSTREAM_PENDING_KEEP: usize = 1;
+const DOWNSTREAM_PENDING_MS: usize = 120;
+const LOOP_WINDOW_FRAMES: usize = 64;
+const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 type SessionIo = (mpsc::Sender<PcmFrame>, mpsc::Receiver<PcmFrame>);
 type ConnectFuture = Pin<Box<dyn Future<Output = Result<SessionIo, SessionError>> + Send>>;
@@ -44,12 +52,13 @@ pub async fn spawn_link(
     role: &LinkRole,
     backend: Arc<dyn AudioBackend>,
     make_url: Arc<dyn Fn() -> String + Send + Sync>,
+    evt_tx: mpsc::Sender<ControlEvent>,
 ) -> Result<LinkHandle, RouteError> {
     let role = role.clone();
     let kind = role.kind;
     let (state_tx, state_rx) = watch::channel(SessionState::Starting);
     let handle = tokio::spawn(async move {
-        run_link(role, backend, make_url, state_tx).await;
+        run_link(role, backend, make_url, state_tx, evt_tx).await;
     });
     let abort = handle.abort_handle();
     Ok(LinkHandle {
@@ -64,6 +73,7 @@ async fn run_link(
     backend: Arc<dyn AudioBackend>,
     make_url: Arc<dyn Fn() -> String + Send + Sync>,
     state_tx: watch::Sender<SessionState>,
+    evt_tx: mpsc::Sender<ControlEvent>,
 ) {
     let connector: SessionConnector = Arc::new(|cfg| {
         Box::pin(connect_with_retry(
@@ -77,7 +87,7 @@ async fn run_link(
             SESSION_CONNECT_ATTEMPTS,
         ))
     });
-    run_link_with_connector(role, backend, make_url, state_tx, connector).await;
+    run_link_with_connector(role, backend, make_url, state_tx, evt_tx, connector).await;
 }
 
 async fn run_link_with_connector(
@@ -85,6 +95,7 @@ async fn run_link_with_connector(
     backend: Arc<dyn AudioBackend>,
     make_url: Arc<dyn Fn() -> String + Send + Sync>,
     state_tx: watch::Sender<SessionState>,
+    evt_tx: mpsc::Sender<ControlEvent>,
     connector: SessionConnector,
 ) {
     let cfg = StreamCfg {
@@ -153,6 +164,10 @@ async fn run_link_with_connector(
             &mut up_resampler,
             &mut down_resampler,
             input_rate,
+            output_rate,
+            role.kind,
+            &state_tx,
+            &evt_tx,
         )
         .await;
 
@@ -215,39 +230,286 @@ async fn pump_session(
     up_resampler: &mut Resampler,
     down_resampler: &mut Resampler,
     input_rate: u32,
+    output_rate: u32,
+    kind: LinkKind,
+    state_tx: &watch::Sender<SessionState>,
+    evt_tx: &mpsc::Sender<ControlEvent>,
 ) {
     let input_chunk = input_buf.len();
     let mut pending_upstream = Vec::new();
+    let mut pending_downstream = Vec::new();
+    let max_pending_downstream = samples_for_ms(output_rate, DOWNSTREAM_PENDING_MS);
+    let mut downstream_dropped_samples = 0u64;
+    let mut last_diag_log = Instant::now();
+    let mut loop_guard = LoopGuardRuntime::new(conservative_loop_thresholds(), LOOP_WINDOW_FRAMES);
 
     loop {
         tokio::select! {
-            _ = tokio::time::sleep(std::time::Duration::from_millis(5)) => {
+            _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                flush_downstream(output, &mut pending_downstream);
                 if try_flush_upstream(&audio_tx, &mut pending_upstream).is_err() {
                     return;
                 }
                 let got = input.pop_slice(input_buf);
-                if got == input_chunk && vad.observe(input_buf) == VadDecision::Send {
-                    let frame = PcmFrame::new(input_buf.to_vec(), input_rate);
-                    let frame16 = up_resampler.process(&frame);
-                    if enqueue_latest_upstream(&audio_tx, &mut pending_upstream, frame16).is_err() {
-                        return;
+                if got == input_chunk {
+                    if let Some(action) = loop_guard.observe_captured(input_buf) {
+                        handle_loop_action(action, kind, &loop_guard, state_tx, evt_tx);
                     }
+                    if !loop_guard.is_paused() && vad.observe(input_buf) == VadDecision::Send {
+                        let frame = PcmFrame::new(input_buf.to_vec(), input_rate);
+                        let frame16 = up_resampler.process(&frame);
+                        if enqueue_latest_upstream(&audio_tx, &mut pending_upstream, frame16).is_err() {
+                            return;
+                        }
+                    }
+                }
+                if last_diag_log.elapsed() >= DIAGNOSTIC_LOG_INTERVAL {
+                    log_link_diagnostics(
+                        kind,
+                        output_rate,
+                        pending_downstream.len(),
+                        downstream_dropped_samples,
+                        &loop_guard,
+                    );
+                    last_diag_log = Instant::now();
                 }
             }
             maybe_frame = audio_rx.recv() => {
                 let Some(frame24) = maybe_frame else {
                     return;
                 };
+                if loop_guard.is_paused() {
+                    downstream_dropped_samples += frame24.samples.len() as u64;
+                    continue;
+                }
                 for chunk in frame24.samples.chunks(DEVICE_FRAME) {
                     let mut block = chunk.to_vec();
                     block.resize(DEVICE_FRAME, 0);
                     let frame = PcmFrame::new(block, GEMINI_OUT_RATE);
                     let out = down_resampler.process(&frame);
-                    let _ = output.push_slice(&out.samples);
+                    loop_guard.observe_injected(&out.samples);
+                    downstream_dropped_samples += append_bounded_downstream(
+                        &mut pending_downstream,
+                        &out.samples,
+                        max_pending_downstream,
+                    ) as u64;
                 }
+                flush_downstream(output, &mut pending_downstream);
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopPipelineAction {
+    Pause,
+    Resume,
+}
+
+#[derive(Debug)]
+struct LoopGuardRuntime {
+    thresholds: LoopThresholds,
+    state: LoopGuardState,
+    injected: Vec<FrameEnergy>,
+    captured: Vec<FrameEnergy>,
+    window_frames: usize,
+    last_evidence: LoopEvidence,
+}
+
+impl LoopGuardRuntime {
+    fn new(thresholds: LoopThresholds, window_frames: usize) -> Self {
+        Self {
+            thresholds,
+            state: LoopGuardState::Clear,
+            injected: Vec::with_capacity(window_frames),
+            captured: Vec::with_capacity(window_frames),
+            window_frames,
+            last_evidence: LoopEvidence {
+                suspected: false,
+                lag_frames: 0,
+                xcorr: 0.0,
+                ratio_db: f32::NEG_INFINITY,
+            },
+        }
+    }
+
+    fn observe_injected(&mut self, samples: &[i16]) {
+        push_energy_window(
+            &mut self.injected,
+            frame_energy(samples),
+            self.window_frames,
+        );
+    }
+
+    fn observe_captured(&mut self, samples: &[i16]) -> Option<LoopPipelineAction> {
+        push_energy_window(
+            &mut self.captured,
+            frame_energy(samples),
+            self.window_frames,
+        );
+        if self.injected.len() < 4 || self.captured.len() < 4 {
+            if self.is_paused() {
+                self.last_evidence = LoopEvidence {
+                    suspected: false,
+                    lag_frames: 0,
+                    xcorr: 0.0,
+                    ratio_db: f32::NEG_INFINITY,
+                };
+                return self.step();
+            }
+            return None;
+        }
+        self.last_evidence = detect_loop(&self.injected, &self.captured, &self.thresholds);
+        self.step()
+    }
+
+    fn step(&mut self) -> Option<LoopPipelineAction> {
+        let (next, action) = step_guard(self.state, &self.last_evidence, &self.thresholds);
+        self.state = next;
+        match action {
+            Some(GuardAction::Pause) => {
+                self.injected.clear();
+                self.captured.clear();
+                Some(LoopPipelineAction::Pause)
+            }
+            Some(GuardAction::Resume) => {
+                self.injected.clear();
+                self.captured.clear();
+                Some(LoopPipelineAction::Resume)
+            }
+            None => None,
+        }
+    }
+
+    fn is_paused(&self) -> bool {
+        matches!(self.state, LoopGuardState::Paused { .. })
+    }
+
+    fn last_evidence(&self) -> LoopEvidence {
+        self.last_evidence
+    }
+}
+
+fn push_energy_window(window: &mut Vec<FrameEnergy>, energy: FrameEnergy, max_len: usize) {
+    if max_len == 0 {
+        return;
+    }
+    window.push(energy);
+    if window.len() > max_len {
+        let excess = window.len() - max_len;
+        window.drain(0..excess);
+    }
+}
+
+fn conservative_loop_thresholds() -> LoopThresholds {
+    LoopThresholds {
+        energy_ratio_db: -12.0,
+        min_xcorr: 0.85,
+        max_lag_frames: 40,
+        hold_frames: 40,
+        release_frames: 80,
+    }
+}
+
+fn handle_loop_action(
+    action: LoopPipelineAction,
+    kind: LinkKind,
+    guard: &LoopGuardRuntime,
+    state_tx: &watch::Sender<SessionState>,
+    evt_tx: &mpsc::Sender<ControlEvent>,
+) {
+    match action {
+        LoopPipelineAction::Pause => {
+            let ev = guard.last_evidence();
+            tracing::warn!(
+                ?kind,
+                lag_frames = ev.lag_frames,
+                xcorr = ev.xcorr,
+                ratio_db = ev.ratio_db,
+                "检测到疑似声学/应用层回环，自动暂停翻译链路"
+            );
+            let _ = state_tx.send(SessionState::Paused);
+            send_control_event(
+                evt_tx,
+                ControlEvent::LoopSuspected {
+                    lag_frames: ev.lag_frames,
+                    xcorr: ev.xcorr,
+                },
+            );
+            send_control_event(
+                evt_tx,
+                ControlEvent::TranslationPaused {
+                    reason: PauseReason::AcousticLoop,
+                },
+            );
+        }
+        LoopPipelineAction::Resume => {
+            tracing::info!(?kind, "回环检测恢复清白，恢复翻译链路");
+            let _ = state_tx.send(SessionState::Running);
+            send_control_event(evt_tx, ControlEvent::TranslationResumed);
+        }
+    }
+}
+
+fn send_control_event(evt_tx: &mpsc::Sender<ControlEvent>, event: ControlEvent) {
+    if let Err(err) = evt_tx.try_send(event) {
+        tracing::warn!(error = %err, "控制事件队列已满或关闭，丢弃事件");
+    }
+}
+
+fn append_bounded_downstream(pending: &mut Vec<i16>, samples: &[i16], max_samples: usize) -> usize {
+    pending.extend_from_slice(samples);
+    if max_samples == 0 {
+        let dropped = pending.len();
+        pending.clear();
+        return dropped;
+    }
+    if pending.len() <= max_samples {
+        return 0;
+    }
+    let dropped = pending.len() - max_samples;
+    pending.drain(0..dropped);
+    dropped
+}
+
+fn flush_downstream(output: &mut audio_core::AudioProducer, pending: &mut Vec<i16>) -> usize {
+    if pending.is_empty() {
+        return 0;
+    }
+    let written = output.push_slice(pending);
+    if written > 0 {
+        pending.drain(0..written);
+    }
+    written
+}
+
+fn samples_for_ms(rate: u32, ms: usize) -> usize {
+    (rate as usize * ms / 1_000).max(1)
+}
+
+fn log_link_diagnostics(
+    kind: LinkKind,
+    output_rate: u32,
+    pending_downstream_samples: usize,
+    downstream_dropped_samples: u64,
+    loop_guard: &LoopGuardRuntime,
+) {
+    let pending_ms = pending_downstream_samples as f64 * 1_000.0 / output_rate as f64;
+    let dropped_ms = downstream_dropped_samples as f64 * 1_000.0 / output_rate as f64;
+    let proxy_ms = pending_ms + DOWNSTREAM_PENDING_MS as f64;
+    let ev = loop_guard.last_evidence();
+    tracing::info!(
+        ?kind,
+        pending_downstream_ms = pending_ms,
+        latency_proxy_ms = proxy_ms,
+        downstream_dropped_samples,
+        downstream_dropped_ms = dropped_ms,
+        loop_xcorr = ev.xcorr,
+        loop_lag_frames = ev.lag_frames,
+        loop_ratio_db = ev.ratio_db,
+        loop_paused = loop_guard.is_paused(),
+        "链路低频诊断"
+    );
 }
 
 fn enqueue_latest_upstream(
@@ -324,6 +586,57 @@ mod tests {
         assert_eq!(audio_rx.try_recv().unwrap().samples[0], 1);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].samples[0], 3);
+    }
+
+    #[test]
+    fn downstream_pending_drops_oldest_to_bound_extra_latency() {
+        let mut pending = vec![1, 2, 3, 4, 5, 6];
+        let dropped = append_bounded_downstream(&mut pending, &[7, 8, 9, 10], 6);
+
+        assert_eq!(dropped, 4);
+        assert_eq!(pending, vec![5, 6, 7, 8, 9, 10]);
+    }
+
+    #[test]
+    fn loop_guard_runtime_pauses_and_resumes_with_events() {
+        let thresholds = diagnostics::LoopThresholds {
+            hold_frames: 2,
+            release_frames: 2,
+            min_xcorr: 0.8,
+            energy_ratio_db: -12.0,
+            max_lag_frames: 6,
+        };
+        let mut guard = LoopGuardRuntime::new(thresholds, 16);
+        let mut actions = Vec::new();
+
+        for n in 0..18 {
+            let injected = vec![((n * 97) % 5000 + 500) as i16; DEVICE_FRAME];
+            guard.observe_injected(&injected);
+            let captured = if n >= 3 {
+                vec![(((n - 3) * 97) % 5000 + 500) as i16; DEVICE_FRAME]
+            } else {
+                vec![0; DEVICE_FRAME]
+            };
+            if let Some(action) = guard.observe_captured(&captured) {
+                actions.push(action);
+                break;
+            }
+        }
+
+        assert_eq!(actions, vec![LoopPipelineAction::Pause]);
+        assert!(guard.is_paused());
+
+        for _ in 0..2 {
+            if let Some(action) = guard.observe_captured(&[0; DEVICE_FRAME]) {
+                actions.push(action);
+            }
+        }
+
+        assert_eq!(
+            actions,
+            vec![LoopPipelineAction::Pause, LoopPipelineAction::Resume]
+        );
+        assert!(!guard.is_paused());
     }
 
     fn frame(sample: i16) -> PcmFrame {

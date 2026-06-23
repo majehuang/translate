@@ -6,6 +6,9 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+const DOWNSTREAM_CHANNEL_CAPACITY: usize = 4;
+const DOWNSTREAM_PENDING_KEEP: usize = 1;
+
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
     #[error("连接失败: {0}")]
@@ -85,7 +88,7 @@ pub async fn connect(
         .map_err(|e| SessionError::Send(e.to_string()))?;
 
     let (audio_tx, mut audio_in) = mpsc::channel::<PcmFrame>(64);
-    let (audio_out, audio_rx) = mpsc::channel::<PcmFrame>(64);
+    let (audio_out, audio_rx) = mpsc::channel::<PcmFrame>(DOWNSTREAM_CHANNEL_CAPACITY);
 
     tokio::spawn(async move {
         while let Some(frame) = audio_in.recv().await {
@@ -102,17 +105,40 @@ pub async fn connect(
 
     let out_rate = cfg.out_rate;
     tokio::spawn(async move {
-        while let Some(Ok(msg)) = read.next().await {
-            let text = match msg {
-                Message::Text(text) => text.to_string(),
-                Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                Message::Close(_) => break,
-                _ => continue,
-            };
-            if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
-                for frame in decode_audio(&server_msg, out_rate) {
-                    if audio_out.send(frame).await.is_err() {
+        let mut pending_out = Vec::new();
+        let mut flush_tick = tokio::time::interval(std::time::Duration::from_millis(5));
+        flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = flush_tick.tick() => {
+                    if flush_lossy_output(&audio_out, &mut pending_out).is_err() {
                         return;
+                    }
+                }
+                maybe_msg = read.next() => {
+                    let Some(result) = maybe_msg else {
+                        return;
+                    };
+                    let msg = match result {
+                        Ok(msg) => msg,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "Gemini Live 下行读取失败");
+                            return;
+                        }
+                    };
+                    let text = match msg {
+                        Message::Text(text) => text.to_string(),
+                        Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+                        Message::Close(_) => return,
+                        _ => continue,
+                    };
+                    if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
+                        for frame in decode_audio(&server_msg, out_rate) {
+                            if try_send_lossy_output(&audio_out, &mut pending_out, frame).is_err() {
+                                return;
+                            }
+                        }
                     }
                 }
             }
@@ -120,6 +146,35 @@ pub async fn connect(
     });
 
     Ok((audio_tx, audio_rx))
+}
+
+fn try_send_lossy_output(
+    audio_out: &mpsc::Sender<PcmFrame>,
+    pending: &mut Vec<PcmFrame>,
+    frame: PcmFrame,
+) -> Result<(), ()> {
+    pending.push(frame);
+    drop_stale_frames(pending, DOWNSTREAM_PENDING_KEEP);
+    flush_lossy_output(audio_out, pending)
+}
+
+fn flush_lossy_output(
+    audio_out: &mpsc::Sender<PcmFrame>,
+    pending: &mut Vec<PcmFrame>,
+) -> Result<(), ()> {
+    while !pending.is_empty() {
+        let frame = pending.remove(0);
+        match audio_out.try_send(frame) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(frame)) => {
+                pending.insert(0, frame);
+                drop_stale_frames(pending, DOWNSTREAM_PENDING_KEEP);
+                return Ok(());
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => return Err(()),
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -145,5 +200,26 @@ mod tests {
             .collect();
         drop_stale_frames(&mut q, 5);
         assert_eq!(q.len(), 2);
+    }
+
+    #[test]
+    fn lossy_output_send_keeps_latest_pending_frame() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let mut pending = Vec::new();
+
+        try_send_lossy_output(&tx, &mut pending, frame(1)).unwrap();
+        try_send_lossy_output(&tx, &mut pending, frame(2)).unwrap();
+        try_send_lossy_output(&tx, &mut pending, frame(3)).unwrap();
+
+        assert_eq!(rx.try_recv().unwrap().samples[0], 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].samples[0], 3);
+
+        flush_lossy_output(&tx, &mut pending).unwrap();
+        assert_eq!(rx.try_recv().unwrap().samples[0], 3);
+    }
+
+    fn frame(sample: i16) -> PcmFrame {
+        PcmFrame::new(vec![sample; 160], 16_000)
     }
 }

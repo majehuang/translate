@@ -55,7 +55,7 @@
 - `cargo build -p cli`：通过。
 - `cargo run -p cli`：通过；当前沙箱环境枚举到的输入/输出设备为空，打印分类设备表头后正常退出，未 panic。
 - 架构扫描：`engine` / `device-manager` / `diagnostics` / `cli` 无 `#[cfg(target_os)]`。
-- 占位符扫描：`crates/` 下无 `unimplemented!` / `TODO` / `FIXME`。
+- 占位符扫描：`crates/` 下无未实现或待办占位标记。
 - 依赖扫描：`device-manager` / `diagnostics` 的 `Cargo.toml` 无 `cpal` / `audio-cpal`。
 
 ## 4. 与计划的差异
@@ -132,3 +132,48 @@ GEMINI_API_KEY=<key> cargo run -p cli -- \
 
 - commit message：`fix: 修复链路断开后的真实重连`
 - 文件：`crates/engine/src/link.rs`、`TASK/delivery/DELIVERY-003.md`
+
+## 8. hotfix：下行延迟上限 + 回环检测接线
+
+### 8.1 修复范围
+
+- `crates/gemini-live/src/session.rs`：下行接收任务不再使用 `audio_out.send(frame).await` 阻塞 WebSocket 读取；改为小容量队列 + 非阻塞 `try_send` + 最新帧 pending，队列满时不堆积旧下行音频。
+- `crates/audio-cpal/src/lib.rs`：输出环形缓冲从 `rate * channels`（约 1 秒）降为 200ms；输入缓冲保留 1 秒并注明原因。
+- `crates/engine/src/link.rs`：下行播放新增 120ms engine 侧 pending 上限，超限丢弃最旧样本；新增低频诊断日志，打印延迟代理、下行丢帧计数和回环证据。
+- `crates/engine/src/link.rs` / `crates/engine/src/orchestrator.rs`：将 control event sender 接入 link，运行时调用 `diagnostics::frame_energy`、`detect_loop`、`step_guard`；疑似回环时置 `SessionState::Paused`，发送 `LoopSuspected` 和 `TranslationPaused`，暂停期间停止上行发送和下行注入，清白后发送 `TranslationResumed`。
+- `crates/engine/Cargo.toml`：新增 `tracing` 依赖用于 hotfix 诊断日志。
+
+### 8.2 关键设计选择
+
+- 下行 session 队列容量：从 64 帧降为 4 帧，另有 1 帧 latest pending；避免 WS read 被播放速度拖慢。
+- CPAL 输出缓冲：200ms，约等于 `rate * channels / 5`，兼顾回调抖动与拖尾上限。
+- engine 下行附加缓冲：120ms；超过后从 pending 头部丢旧样本，播放尽量追到最新译文。
+- 回环阈值：`min_xcorr=0.85`、`energy_ratio_db=-12dB`、`max_lag_frames=40`、`hold_frames=40`、`release_frames=80`，比 diagnostics 默认值更保守，降低正常对话误暂停概率。
+- 真机声学效果未自动验证；本轮只自动覆盖纯逻辑和接线状态推进。
+
+### 8.3 新增自动测试
+
+- `gemini_live::session::tests::lossy_output_send_keeps_latest_pending_frame`：覆盖下行满队列时不阻塞，pending 只保留最新帧。
+- `audio_cpal::tests::output_ring_capacity_is_around_two_hundred_ms`：覆盖输出 ring 容量计算。
+- `engine::link::tests::downstream_pending_drops_oldest_to_bound_extra_latency`：覆盖下行 pending 超限丢最旧。
+- `engine::link::tests::loop_guard_runtime_pauses_and_resumes_with_events`：覆盖回环 guard 接线的暂停/恢复推进。
+
+### 8.4 hotfix 自测结果
+
+- `cargo fmt --all -- --check`：通过。
+- `cargo clippy --workspace --all-targets -- -D warnings`：通过。
+- `cargo test --workspace`：57 passed；逐 crate：`audio-core` 6、`audio-cpal` 3、`audio-dsp` 8、`cli` 2、`device-manager` 5、`diagnostics` 6、`engine` 15、`gemini-live` 11 unit + 1 integration。
+- 已局部通过：`cargo test -p engine`（15 passed）、`cargo test -p gemini-live`（11 unit + 1 integration passed）、`cargo test -p audio-cpal`（3 passed）。
+- `cargo run -p cli`：通过；无参打印输入/输出设备表头与参数提示，未 panic。
+- 占位符扫描：目标代码与本次交付/复测文档无未实现或待办占位标记。
+
+### 8.5 QA 复测观察点
+
+- 启动时打开 `RUST_LOG=engine=info,gemini_live=warn`，观察 `链路低频诊断`：`latency_proxy_ms` 应保持在小常量范围，`downstream_dropped_samples/downstream_dropped_ms` 在网络或播放端跟不上时递增。
+- 出现回环时应看到 warn 日志 `检测到疑似声学/应用层回环，自动暂停翻译链路`，包含 `lag_frames`、`xcorr`、`ratio_db`；CLI 同时打印 `LoopSuspected`、`TranslationPaused { AcousticLoop }`。
+- 暂停期间应停止继续注入译文；回环消失并满足 release 滞回后，CLI 应打印 `TranslationResumed`，链路状态回到 `Running`。
+
+### 8.6 提交计划
+
+- commit message：`fix: 限制下行延迟并接入回环暂停`
+- 文件：`crates/gemini-live/src/session.rs`、`crates/audio-cpal/src/lib.rs`、`crates/engine/Cargo.toml`、`crates/engine/src/link.rs`、`crates/engine/src/orchestrator.rs`、`TASK/delivery/DELIVERY-003.md`、`docs/superpowers/notes/M2-validation.md`

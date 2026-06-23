@@ -8,6 +8,8 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use std::sync::mpsc;
 use std::time::Duration;
 
+const OUTPUT_RING_MS: usize = 200;
+
 pub struct CpalBackend {
     host: cpal::Host,
 }
@@ -114,6 +116,11 @@ where
     T::from_sample(sample)
 }
 
+fn ring_capacity_samples(rate: u32, channels: usize, ms: usize) -> usize {
+    let per_channel = (rate as usize * ms / 1_000).max(1);
+    per_channel * channels.max(1)
+}
+
 fn build_input_stream<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -208,6 +215,7 @@ impl AudioBackend for CpalBackend {
             .map_err(|e| AudioError::OpenStream(e.to_string()))?;
         let rate = supported.sample_rate().0;
         let channels = supported.channels() as usize;
+        // 输入可维持 1 秒缓冲，给 VAD/重采样线程短时抖动留余量；下行输出另行收紧。
         let (prod, cons) = audio_channel(rate as usize * channels);
         let stream_config = supported.config();
         let stream = match supported.sample_format() {
@@ -242,7 +250,7 @@ impl AudioBackend for CpalBackend {
             .map_err(|e| AudioError::OpenStream(e.to_string()))?;
         let rate = supported.sample_rate().0;
         let channels = supported.channels() as usize;
-        let (prod, cons) = audio_channel(rate as usize * channels);
+        let (prod, cons) = audio_channel(ring_capacity_samples(rate, channels, OUTPUT_RING_MS));
         let stream_config = supported.config();
         let stream = match supported.sample_format() {
             SampleFormat::F32 => {
@@ -315,6 +323,12 @@ impl AudioBackend for CpalBackend {
 mod tests {
     use super::*;
     use audio_core::AudioBackend;
+
+    #[test]
+    fn output_ring_capacity_is_around_two_hundred_ms() {
+        assert_eq!(ring_capacity_samples(48_000, 2, OUTPUT_RING_MS), 19_200);
+        assert_eq!(ring_capacity_samples(16_000, 1, OUTPUT_RING_MS), 3_200);
+    }
 
     #[test]
     fn backend_lists_without_panicking() {
