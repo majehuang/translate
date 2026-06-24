@@ -132,9 +132,23 @@ pub async fn connect(
                     let text = match msg {
                         Message::Text(text) => text.to_string(),
                         Message::Binary(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-                        Message::Close(_) => return,
+                        Message::Close(frame) => {
+                            match frame {
+                                Some(cf) => tracing::warn!(
+                                    code = %cf.code,
+                                    reason = %cf.reason,
+                                    "Gemini Live 关闭连接"
+                                ),
+                                None => tracing::warn!("Gemini Live 关闭连接（无原因帧）"),
+                            }
+                            return;
+                        }
                         _ => continue,
                     };
+                    // 暴露 Gemini 的报错文本（错误常以普通 Text 下发，会被 ServerMessage 静默忽略）。
+                    if text.contains("error") || text.contains("Invalid") || text.contains("quota") {
+                        tracing::warn!(payload = %text, "Gemini Live 返回疑似错误消息");
+                    }
                     if let Ok(server_msg) = serde_json::from_str::<ServerMessage>(&text) {
                         for frame in decode_audio(&server_msg, out_rate) {
                             if try_send_lossy_output(&audio_out, &mut pending_out, frame).is_err() {
