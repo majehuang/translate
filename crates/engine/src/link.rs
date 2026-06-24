@@ -250,6 +250,12 @@ async fn pump_session(
     if vad_disabled {
         tracing::info!(?kind, "上行 VAD 已禁用（发连续音频）");
     }
+    // 回环检测默认关闭：当前 detect_loop 在长时间静音段可能误判（近零信号互相关偏高）
+    // 而误暂停整条链路、吞掉全部音频。设 TRANSLATE_LOOPGUARD=1 才启用。无声学环路时无需开。
+    let loopguard_enabled = std::env::var("TRANSLATE_LOOPGUARD").is_ok();
+    if loopguard_enabled {
+        tracing::info!(?kind, "回环检测已启用");
+    }
 
     loop {
         tokio::select! {
@@ -260,8 +266,10 @@ async fn pump_session(
                 }
                 let got = input.pop_slice(input_buf);
                 if got == input_chunk {
-                    if let Some(action) = loop_guard.observe_captured(input_buf) {
-                        handle_loop_action(action, kind, &loop_guard, state_tx, evt_tx);
+                    if loopguard_enabled {
+                        if let Some(action) = loop_guard.observe_captured(input_buf) {
+                            handle_loop_action(action, kind, &loop_guard, state_tx, evt_tx);
+                        }
                     }
                     let voice_active = if vad_disabled {
                         true
@@ -300,7 +308,9 @@ async fn pump_session(
                     block.resize(DEVICE_FRAME, 0);
                     let frame = PcmFrame::new(block, GEMINI_OUT_RATE);
                     let out = down_resampler.process(&frame);
-                    loop_guard.observe_injected(&out.samples);
+                    if loopguard_enabled {
+                        loop_guard.observe_injected(&out.samples);
+                    }
                     downstream_dropped_samples += append_bounded_downstream(
                         &mut pending_downstream,
                         &out.samples,
