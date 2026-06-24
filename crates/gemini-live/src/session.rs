@@ -6,6 +6,8 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+// 下行通道：仅在 pump 落后 ≥ CAPACITY 帧时才跳到最新帧（skip-to-latest）。
+// 真正的播放缓冲与延迟上限在 engine（pending 1s）+ 输出 ring（1s）里，这里保持小而非阻塞。
 const DOWNSTREAM_CHANNEL_CAPACITY: usize = 4;
 const DOWNSTREAM_PENDING_KEEP: usize = 1;
 

@@ -23,7 +23,9 @@ const DEVICE_FRAME: usize = 480;
 const SESSION_CONNECT_ATTEMPTS: u32 = 5;
 const MAX_RECONNECT_ATTEMPTS: u32 = 5;
 const UPSTREAM_PENDING_KEEP: usize = 1;
-const DOWNSTREAM_PENDING_MS: usize = 120;
+// 下行播放缓冲上限：必须 ≥ 一句译文的时长，否则会把整句截短（Gemini 按整句返回多秒音频）。
+// 设为 1s，仅在跨句严重积压时丢旧，不截断当前句。
+const DOWNSTREAM_PENDING_MS: usize = 1000;
 const LOOP_WINDOW_FRAMES: usize = 64;
 const DIAGNOSTIC_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
