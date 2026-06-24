@@ -242,6 +242,11 @@ async fn pump_session(
     let mut pending_downstream = Vec::new();
     let max_pending_downstream = samples_for_ms(output_rate, DOWNSTREAM_PENDING_MS);
     let mut downstream_dropped_samples = 0u64;
+    // 分阶段计数，定位"没声音"卡在哪一段：采到麦克风/VAD 放行发往 Gemini/收到 Gemini 译文/写进播放设备。
+    let mut input_chunks = 0u64;
+    let mut upstream_sent = 0u64;
+    let mut downstream_recv = 0u64;
+    let mut output_written = 0u64;
     let mut last_diag_log = Instant::now();
     let mut loop_guard = LoopGuardRuntime::new(conservative_loop_thresholds(), LOOP_WINDOW_FRAMES);
     // 实验开关：设 TRANSLATE_NO_VAD=1 则不丢静音、发连续音频，交给 Gemini 服务端做 turn 检测。
@@ -260,12 +265,13 @@ async fn pump_session(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                flush_downstream(output, &mut pending_downstream);
+                output_written += flush_downstream(output, &mut pending_downstream) as u64;
                 if try_flush_upstream(&audio_tx, &mut pending_upstream).is_err() {
                     return;
                 }
                 let got = input.pop_slice(input_buf);
                 if got == input_chunk {
+                    input_chunks += 1;
                     if loopguard_enabled {
                         if let Some(action) = loop_guard.observe_captured(input_buf) {
                             handle_loop_action(action, kind, &loop_guard, state_tx, evt_tx);
@@ -282,6 +288,7 @@ async fn pump_session(
                         if enqueue_latest_upstream(&audio_tx, &mut pending_upstream, frame16).is_err() {
                             return;
                         }
+                        upstream_sent += 1;
                     }
                 }
                 if last_diag_log.elapsed() >= DIAGNOSTIC_LOG_INTERVAL {
@@ -291,6 +298,10 @@ async fn pump_session(
                         pending_downstream.len(),
                         downstream_dropped_samples,
                         &loop_guard,
+                        input_chunks,
+                        upstream_sent,
+                        downstream_recv,
+                        output_written,
                     );
                     last_diag_log = Instant::now();
                 }
@@ -299,6 +310,7 @@ async fn pump_session(
                 let Some(frame24) = maybe_frame else {
                     return;
                 };
+                downstream_recv += 1;
                 if loop_guard.is_paused() {
                     downstream_dropped_samples += frame24.samples.len() as u64;
                     continue;
@@ -317,7 +329,7 @@ async fn pump_session(
                         max_pending_downstream,
                     ) as u64;
                 }
-                flush_downstream(output, &mut pending_downstream);
+                output_written += flush_downstream(output, &mut pending_downstream) as u64;
             }
         }
     }
@@ -510,12 +522,17 @@ fn samples_for_ms(rate: u32, ms: usize) -> usize {
     (rate as usize * ms / 1_000).max(1)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn log_link_diagnostics(
     kind: LinkKind,
     output_rate: u32,
     pending_downstream_samples: usize,
     downstream_dropped_samples: u64,
     loop_guard: &LoopGuardRuntime,
+    input_chunks: u64,
+    upstream_sent: u64,
+    downstream_recv: u64,
+    output_written: u64,
 ) {
     let pending_ms = pending_downstream_samples as f64 * 1_000.0 / output_rate as f64;
     let dropped_ms = downstream_dropped_samples as f64 * 1_000.0 / output_rate as f64;
@@ -523,6 +540,10 @@ fn log_link_diagnostics(
     let ev = loop_guard.last_evidence();
     tracing::info!(
         ?kind,
+        input_chunks,    // 采到的麦克风块数（0=没采到输入设备音频）
+        upstream_sent,   // 经 VAD 放行、发往 Gemini 的帧数（0=VAD 全挡或没说话）
+        downstream_recv, // 从 Gemini 收到的译文音频帧数（0=Gemini 没返回音频）
+        output_written,  // 写进播放设备的样本数（0=有数据但没进设备）
         pending_downstream_ms = pending_ms,
         latency_proxy_ms = proxy_ms,
         downstream_dropped_samples,
