@@ -126,7 +126,15 @@ async fn run_link_with_connector(
     let target_lang = role.target_lang.clone();
     let input_chunk = (input_rate / 100).max(1) as usize;
     let mut input_buf = vec![0i16; input_chunk];
-    let mut vad = Vad::new(VadConfig::default_uplink());
+    let vad_cfg = vad_config_from_env();
+    tracing::info!(
+        rms_open = vad_cfg.rms_open,
+        rms_close = vad_cfg.rms_close,
+        attack_frames = vad_cfg.attack_frames,
+        noise_margin_pct = vad_cfg.noise_margin_pct,
+        "VAD 配置"
+    );
+    let mut vad = Vad::new(vad_cfg);
     let mut up_resampler = Resampler::new(input_rate, GEMINI_IN_RATE, input_chunk);
     let mut down_resampler = Resampler::new(GEMINI_OUT_RATE, output_rate, DEVICE_FRAME);
     let _keep_alive = (input_stream, output_stream);
@@ -520,6 +528,35 @@ fn flush_downstream(output: &mut audio_core::AudioProducer, pending: &mut Vec<i1
 
 fn samples_for_ms(rate: u32, ms: usize) -> usize {
     (rate as usize * ms / 1_000).max(1)
+}
+
+/// 从环境变量覆盖 VAD 灵敏度，便于现场按房间噪声标定（无需重编译）：
+/// TRANSLATE_VAD_RMS_OPEN / TRANSLATE_VAD_RMS_CLOSE / TRANSLATE_VAD_ATTACK /
+/// TRANSLATE_VAD_HANGOVER / TRANSLATE_VAD_NOISE_MARGIN。噪声误触发严重时调大 RMS_OPEN/ATTACK。
+fn vad_config_from_env() -> VadConfig {
+    let mut cfg = VadConfig::default_uplink();
+    if let Some(v) = env_parse("TRANSLATE_VAD_RMS_OPEN") {
+        cfg.rms_open = v;
+    }
+    if let Some(v) = env_parse("TRANSLATE_VAD_RMS_CLOSE") {
+        cfg.rms_close = v;
+    }
+    if let Some(v) = env_parse::<u16>("TRANSLATE_VAD_ATTACK") {
+        cfg.attack_frames = v;
+    }
+    if let Some(v) = env_parse::<u16>("TRANSLATE_VAD_HANGOVER") {
+        cfg.hangover_frames = v;
+    }
+    if let Some(v) = env_parse("TRANSLATE_VAD_NOISE_MARGIN") {
+        cfg.noise_margin_pct = v;
+    }
+    cfg
+}
+
+fn env_parse<T: std::str::FromStr>(key: &str) -> Option<T> {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<T>().ok())
 }
 
 #[allow(clippy::too_many_arguments)]

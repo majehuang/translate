@@ -35,21 +35,27 @@ pub fn zero_crossing_rate(samples: &[i16]) -> u16 {
 
 #[derive(Debug, Clone, Copy)]
 pub struct VadConfig {
+    /// 开启语音的绝对 RMS 下限（噪声底之上还需至少到这个值）。
     pub rms_open: u32,
+    /// 维持语音的 RMS（滞回，低于 open 以免抖动）。
     pub rms_close: u32,
     pub zcr_noise_max: u16,
     pub hangover_frames: u16,
     pub attack_frames: u16,
+    /// 开启阈值相对自适应噪声底的倍数（百分比）。300 = 需达噪声底的 3 倍。
+    /// 噪声越大，动态门限自动抬高，抑制把环境噪音当语音。
+    pub noise_margin_pct: u32,
 }
 
 impl VadConfig {
     pub fn default_uplink() -> Self {
         Self {
-            rms_open: 600,
-            rms_close: 300,
+            rms_open: 1000,
+            rms_close: 550,
             zcr_noise_max: 168,
             hangover_frames: 30,
-            attack_frames: 2,
+            attack_frames: 4,
+            noise_margin_pct: 250,
         }
     }
 }
@@ -83,6 +89,8 @@ pub struct Vad {
     speaking: bool,
     attack_count: u16,
     hangover_count: u16,
+    /// 自适应环境噪声底（慢速 EMA，仅在非语音帧更新）。
+    noise_floor: u32,
 }
 
 impl Vad {
@@ -92,6 +100,7 @@ impl Vad {
             speaking: false,
             attack_count: 0,
             hangover_count: 0,
+            noise_floor: 0,
         }
     }
 
@@ -99,8 +108,41 @@ impl Vad {
         self.speaking
     }
 
+    /// 当前估计的环境噪声底（供诊断）。
+    pub fn noise_floor(&self) -> u32 {
+        self.noise_floor
+    }
+
+    /// 当前生效的开启门限（取绝对下限与“噪声底×margin”的较大者）。
+    pub fn dynamic_open(&self) -> u32 {
+        self.cfg
+            .rms_open
+            .max(self.noise_floor.saturating_mul(self.cfg.noise_margin_pct) / 100)
+    }
+
     pub fn observe(&mut self, samples: &[i16]) -> VadDecision {
-        let voiced = classify_frame(samples, &self.cfg, self.speaking);
+        let rms = frame_energy_rms(samples);
+        let zcr = zero_crossing_rate(samples);
+        let dynamic_open = self.dynamic_open();
+        let threshold = if self.speaking {
+            self.cfg.rms_close
+        } else {
+            dynamic_open
+        };
+        // 高过零率且能量不够强 → 视为噪声/底噪，拒绝；很响的真实语音仍放行。
+        let noise_like = zcr > self.cfg.zcr_noise_max && rms < dynamic_open.saturating_mul(2);
+        let voiced = rms >= threshold && !noise_like;
+
+        // 跟踪环境底噪：未进入确认说话态时，遇更低能量立刻下探（抓安静基线），
+        // 遇更高能量缓慢上抬（适应持续噪声）。说话期间冻结，避免语音污染底噪。
+        if !self.speaking {
+            self.noise_floor = if rms < self.noise_floor {
+                rms // 快速下探，抓住安静基线（避免被一帧响声永久抬高）
+            } else {
+                self.noise_floor + (rms - self.noise_floor) / 64 // 缓慢上抬，适应持续噪声
+            };
+        }
+
         if !self.speaking {
             if voiced {
                 self.attack_count += 1;
@@ -222,6 +264,46 @@ mod tests {
         assert_eq!(frame_energy_rms(&[0i16; 256]), 0);
         assert!((frame_energy_rms(&[3000; 256]) as i32 - 3000).abs() <= 1);
         assert_eq!(frame_energy_rms(&[]), 0);
+    }
+
+    /// 低过零率、可控能量的块（半正半负），用于隔离能量/噪声底逻辑（不被 ZCR 门拦）。
+    fn block(amp: i16, n: usize) -> Vec<i16> {
+        (0..n).map(|i| if i < n / 2 { amp } else { -amp }).collect()
+    }
+
+    #[test]
+    fn sustained_ambient_noise_below_threshold_never_opens() {
+        let cfg = VadConfig::default_uplink();
+        let mut vad = Vad::new(cfg);
+        // 持续环境噪声，能量低于 rms_open（1000）。
+        let noise = block(800, 480);
+        let mut sends = 0;
+        for _ in 0..200 {
+            if vad.observe(&noise) == VadDecision::Send {
+                sends += 1;
+            }
+        }
+        assert_eq!(sends, 0, "环境噪声被误判为语音");
+        assert!(!vad.is_speaking());
+        // 噪声底应跟踪到接近噪声水平。
+        assert!(vad.noise_floor() >= 600, "floor={}", vad.noise_floor());
+    }
+
+    #[test]
+    fn loud_speech_opens_even_with_elevated_noise_floor() {
+        let cfg = VadConfig::default_uplink();
+        let mut vad = Vad::new(cfg);
+        for _ in 0..100 {
+            let _ = vad.observe(&block(800, 480)); // 抬高噪声底
+        }
+        let loud = block(9000, 480); // 远高于动态门限
+        let mut opened = false;
+        for _ in 0..(cfg.attack_frames + 1) {
+            if vad.observe(&loud) == VadDecision::Send {
+                opened = true;
+            }
+        }
+        assert!(opened, "嘈杂环境下真实大声语音应能开启");
     }
 
     #[test]
