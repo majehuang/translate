@@ -248,7 +248,15 @@ async fn pump_session(
     let input_chunk = input_buf.len();
     let mut pending_upstream = Vec::new();
     let mut pending_downstream = Vec::new();
-    let max_pending_downstream = samples_for_ms(output_rate, DOWNSTREAM_PENDING_MS);
+    // 抖动缓冲：预缓冲 jitter_ms（默认 1500，可调）再开播，吸收网络抖动，避免断断续续。
+    let jitter_ms = env_parse::<usize>("TRANSLATE_JITTER_MS").unwrap_or(1500);
+    let mut jitter = JitterBuffer::new(
+        samples_for_ms(output_rate, jitter_ms),
+        samples_for_ms(output_rate, 150),
+    );
+    tracing::info!(?kind, jitter_ms, "下行抖动缓冲（预缓冲后播放）");
+    // 丢弃上限远高于预缓冲，避免缓冲期被误丢；仅在极端积压（>预缓冲+2.5s）才丢旧。
+    let max_pending_downstream = samples_for_ms(output_rate, jitter_ms + 2500);
     let mut downstream_dropped_samples = 0u64;
     // 分阶段计数，定位"没声音"卡在哪一段：采到麦克风/VAD 放行发往 Gemini/收到 Gemini 译文/写进播放设备。
     let mut input_chunks = 0u64;
@@ -273,7 +281,7 @@ async fn pump_session(
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                output_written += flush_downstream(output, &mut pending_downstream) as u64;
+                output_written += jitter.flush(output, &mut pending_downstream) as u64;
                 if try_flush_upstream(&audio_tx, &mut pending_upstream).is_err() {
                     return;
                 }
@@ -337,7 +345,7 @@ async fn pump_session(
                         max_pending_downstream,
                     ) as u64;
                 }
-                output_written += flush_downstream(output, &mut pending_downstream) as u64;
+                output_written += jitter.flush(output, &mut pending_downstream) as u64;
             }
         }
     }
@@ -515,15 +523,48 @@ fn append_bounded_downstream(pending: &mut Vec<i16>, samples: &[i16], max_sample
     dropped
 }
 
-fn flush_downstream(output: &mut audio_core::AudioProducer, pending: &mut Vec<i16>) -> usize {
-    if pending.is_empty() {
-        return 0;
+/// 下行抖动缓冲：先攒够 `prebuffer` 样本再开播；播放中环形见底（低于 `low_watermark`
+/// 且本地无积压）则回到缓冲态重新预热。用网络抖动换取连续不卡顿的播放。
+struct JitterBuffer {
+    playing: bool,
+    prebuffer: usize,
+    low_watermark: usize,
+}
+
+impl JitterBuffer {
+    fn new(prebuffer: usize, low_watermark: usize) -> Self {
+        Self {
+            playing: false,
+            prebuffer,
+            low_watermark,
+        }
     }
-    let written = output.push_slice(pending);
-    if written > 0 {
-        pending.drain(0..written);
+
+    /// 返回本次实际写入播放设备的样本数。
+    fn flush(&mut self, output: &mut audio_core::AudioProducer, pending: &mut Vec<i16>) -> usize {
+        let buffered = output.occupied_len() + pending.len();
+        if !self.playing {
+            if buffered >= self.prebuffer {
+                self.playing = true; // 预缓冲已满，开播
+            } else {
+                return 0; // 继续缓冲，输出静音
+            }
+        }
+        let written = if pending.is_empty() {
+            0
+        } else {
+            let n = output.push_slice(pending);
+            if n > 0 {
+                pending.drain(0..n);
+            }
+            n
+        };
+        // 缓冲枯竭 → 回到缓冲态，避免逐帧断续；下个语音突发重新预热。
+        if pending.is_empty() && output.occupied_len() < self.low_watermark {
+            self.playing = false;
+        }
+        written
     }
-    written
 }
 
 fn samples_for_ms(rate: u32, ms: usize) -> usize {

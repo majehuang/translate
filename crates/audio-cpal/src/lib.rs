@@ -8,9 +8,8 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 use std::sync::mpsc;
 use std::time::Duration;
 
-// 播放抖动缓冲：需容纳一句译文（Gemini 可能以快于实时的突发下发多秒音频），
-// 太小会把句尾截掉。1s 足够，靠实时消费维持节奏。
-const OUTPUT_RING_MS: usize = 1000;
+// 播放抖动缓冲容量：需容纳 jitter 预缓冲（默认 ~1.5s）+ 突发余量。设 3s。
+const OUTPUT_RING_MS: usize = 3000;
 
 pub struct CpalBackend {
     host: cpal::Host,
@@ -327,9 +326,9 @@ mod tests {
     use audio_core::AudioBackend;
 
     #[test]
-    fn output_ring_capacity_is_around_one_second() {
-        assert_eq!(ring_capacity_samples(48_000, 2, OUTPUT_RING_MS), 96_000);
-        assert_eq!(ring_capacity_samples(16_000, 1, OUTPUT_RING_MS), 16_000);
+    fn output_ring_capacity_is_around_three_seconds() {
+        assert_eq!(ring_capacity_samples(48_000, 2, OUTPUT_RING_MS), 288_000);
+        assert_eq!(ring_capacity_samples(16_000, 1, OUTPUT_RING_MS), 48_000);
     }
 
     #[test]

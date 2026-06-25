@@ -2,7 +2,7 @@
 //! 基于 ringbuf 0.4 的普通 `Producer::push_slice`：缓冲满时只写入可容纳
 //! 的前缀，溢出的新样本被丢弃，不覆盖旧样本，并且不阻塞回调线程。
 
-use ringbuf::traits::{Consumer, Producer, Split};
+use ringbuf::traits::{Consumer, Observer, Producer, Split};
 use ringbuf::HeapRb;
 
 pub struct AudioProducer {
@@ -25,6 +25,11 @@ impl AudioProducer {
     pub fn push_slice(&mut self, data: &[i16]) -> usize {
         self.inner.push_slice(data)
     }
+
+    /// 当前缓冲中已排队、尚未被消费（播放）的样本数。用于抖动缓冲判断播放深度。
+    pub fn occupied_len(&self) -> usize {
+        self.inner.occupied_len()
+    }
 }
 
 impl AudioConsumer {
@@ -45,6 +50,17 @@ mod tests {
         let mut out = [0i16; 4];
         assert_eq!(cons.pop_slice(&mut out), 3);
         assert_eq!(&out[..3], &[1, 2, 3]);
+    }
+
+    #[test]
+    fn occupied_len_tracks_queued_samples() {
+        let (mut prod, mut cons) = audio_channel(8);
+        assert_eq!(prod.occupied_len(), 0);
+        prod.push_slice(&[1, 2, 3, 4, 5]);
+        assert_eq!(prod.occupied_len(), 5);
+        let mut out = [0i16; 2];
+        cons.pop_slice(&mut out);
+        assert_eq!(prod.occupied_len(), 3);
     }
 
     #[test]
